@@ -23,12 +23,12 @@
 #include <string>
 #include <vector>
 
-#include "src/binary-reader-interp.h"
 #include "src/binary-reader.h"
 #include "src/cast.h"
-#include "src/error-handler.h"
+#include "src/error-formatter.h"
 #include "src/feature.h"
-#include "src/interp.h"
+#include "src/interp/binary-reader-interp.h"
+#include "src/interp/interp.h"
 #include "src/literal.h"
 #include "src/option-parser.h"
 #include "src/resolve-names.h"
@@ -118,6 +118,9 @@ static void RunAllExports(interp::Module* module,
   TypedValues args;
   TypedValues results;
   for (const interp::Export& export_ : module->exports) {
+    if (export_.kind != ExternalKind::Func) {
+      continue;
+    }
     ExecResult exec_result = executor->RunExport(&export_, args);
     if (verbose == RunVerbosity::Verbose) {
       WriteCall(s_stdout_stream.get(), string_view(), export_.name, args,
@@ -128,7 +131,7 @@ static void RunAllExports(interp::Module* module,
 
 static wabt::Result ReadModule(const char* module_filename,
                                Environment* env,
-                               ErrorHandler* error_handler,
+                               Errors* errors,
                                DefinedModule** out_module) {
   wabt::Result result;
   std::vector<uint8_t> file_data;
@@ -143,7 +146,7 @@ static wabt::Result ReadModule(const char* module_filename,
     ReadBinaryOptions options(s_features, s_log_stream.get(), kReadDebugNames,
                               kStopOnFirstError, kFailOnCustomSectionError);
     result = ReadBinaryInterp(env, file_data.data(), file_data.size(), options,
-                              error_handler, out_module);
+                              errors, out_module);
 
     if (Succeeded(result)) {
       if (s_verbose) {
@@ -186,9 +189,10 @@ static wabt::Result ReadAndRunModule(const char* module_filename) {
   Environment env;
   InitEnvironment(&env);
 
-  ErrorHandlerFile error_handler(Location::Type::Binary);
+  Errors errors;
   DefinedModule* module = nullptr;
-  result = ReadModule(module_filename, &env, &error_handler, &module);
+  result = ReadModule(module_filename, &env, &errors, &module);
+  FormatErrorsToFile(errors, Location::Type::Binary);
   if (Succeeded(result)) {
     Executor executor(&env, s_trace_stream, s_thread_options);
     ExecResult exec_result = executor.RunStartFunction(module);

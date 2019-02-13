@@ -19,11 +19,9 @@
 #include "src/binary-reader-ir.h"
 #include "src/binary-reader.h"
 #include "src/cast.h"
-#include "src/error-handler.h"
 #include "src/expr-visitor.h"
 #include "src/make-unique.h"
 #include "src/utf8.h"
-#include "src/wast-parser-lexer-shared.h"
 
 #define WABT_TRACING 0
 #include "src/tracing.h"
@@ -105,42 +103,6 @@ void RemoveEscapes(const TextVector& texts, OutputIter out) {
     RemoveEscapes(text, out);
 }
 
-class BinaryErrorHandlerModule : public ErrorHandler {
- public:
-  BinaryErrorHandlerModule(Location* loc, WastParser* parser);
-  bool OnError(ErrorLevel,
-               const Location&,
-               const std::string& error,
-               const std::string& source_line,
-               size_t source_line_column_offset) override;
-
-  // Unused.
-  size_t source_line_max_length() const override { return 0; }
-
- private:
-  Location* loc_;
-  WastParser* parser_;
-};
-
-BinaryErrorHandlerModule::BinaryErrorHandlerModule(Location* loc,
-                                                   WastParser* parser)
-    : ErrorHandler(Location::Type::Binary), loc_(loc), parser_(parser) {}
-
-bool BinaryErrorHandlerModule::OnError(ErrorLevel error_level,
-                                       const Location& binary_loc,
-                                       const std::string& error,
-                                       const std::string& source_line,
-                                       size_t source_line_column_offset) {
-  assert(error_level == ErrorLevel::Error);
-  if (binary_loc.offset == kInvalidOffset) {
-    parser_->Error(*loc_, "error in binary module: %s", error.c_str());
-  } else {
-    parser_->Error(*loc_, "error in binary module: @0x%08" PRIzx ": %s",
-                   binary_loc.offset, error.c_str());
-  }
-  return true;
-}
-
 bool IsPlainInstr(TokenType token_type) {
   switch (token_type) {
     case TokenType::Unreachable:
@@ -151,13 +113,15 @@ bool IsPlainInstr(TokenType token_type) {
     case TokenType::BrIf:
     case TokenType::BrTable:
     case TokenType::Return:
+    case TokenType::ReturnCall:
+    case TokenType::ReturnCallIndirect:
     case TokenType::Call:
     case TokenType::CallIndirect:
-    case TokenType::GetLocal:
-    case TokenType::SetLocal:
-    case TokenType::TeeLocal:
-    case TokenType::GetGlobal:
-    case TokenType::SetGlobal:
+    case TokenType::LocalGet:
+    case TokenType::LocalSet:
+    case TokenType::LocalTee:
+    case TokenType::GlobalGet:
+    case TokenType::GlobalSet:
     case TokenType::Load:
     case TokenType::Store:
     case TokenType::Const:
@@ -165,15 +129,22 @@ bool IsPlainInstr(TokenType token_type) {
     case TokenType::Binary:
     case TokenType::Compare:
     case TokenType::Convert:
-    case TokenType::MemorySize:
+    case TokenType::MemoryCopy:
+    case TokenType::DataDrop:
+    case TokenType::MemoryFill:
     case TokenType::MemoryGrow:
+    case TokenType::MemoryInit:
+    case TokenType::MemorySize:
+    case TokenType::TableCopy:
+    case TokenType::ElemDrop:
+    case TokenType::TableInit:
     case TokenType::Throw:
     case TokenType::Rethrow:
     case TokenType::AtomicLoad:
     case TokenType::AtomicStore:
     case TokenType::AtomicRmw:
     case TokenType::AtomicRmwCmpxchg:
-    case TokenType::AtomicWake:
+    case TokenType::AtomicNotify:
     case TokenType::AtomicWait:
     case TokenType::Ternary:
     case TokenType::SimdLaneOp:
@@ -189,7 +160,6 @@ bool IsBlockInstr(TokenType token_type) {
     case TokenType::Block:
     case TokenType::Loop:
     case TokenType::If:
-    case TokenType::IfExcept:
     case TokenType::Try:
       return true;
     default:
@@ -217,7 +187,7 @@ bool IsModuleField(TokenTypePair pair) {
   switch (pair[1]) {
     case TokenType::Data:
     case TokenType::Elem:
-    case TokenType::Except:
+    case TokenType::Event:
     case TokenType::Export:
     case TokenType::Func:
     case TokenType::Type:
@@ -256,31 +226,39 @@ bool IsCommand(TokenTypePair pair) {
   }
 }
 
-bool IsEmptySignature(const FuncSignature* sig) {
-  return sig->result_types.empty() && sig->param_types.empty();
+bool IsEmptySignature(const FuncSignature& sig) {
+  return sig.result_types.empty() && sig.param_types.empty();
 }
 
-void ResolveFuncType(const Location& loc,
-                     Module* module,
-                     FuncDeclaration* decl) {
+void ResolveFuncTypeWithEmptySignature(const Module& module,
+                                       FuncDeclaration* decl) {
   // Resolve func type variables where the signature was not specified
   // explicitly, e.g.: (func (type 1) ...)
-  if (decl->has_func_type && IsEmptySignature(&decl->sig)) {
-    FuncType* func_type = module->GetFuncType(decl->type_var);
+  if (decl->has_func_type && IsEmptySignature(decl->sig)) {
+    const FuncType* func_type = module.GetFuncType(decl->type_var);
     if (func_type) {
       decl->sig = func_type->sig;
     }
   }
 
+}
+
+void ResolveImplicitlyDefinedFunctionType(const Location& loc,
+                                          Module* module,
+                                          const FuncDeclaration& decl) {
   // Resolve implicitly defined function types, e.g.: (func (param i32) ...)
-  if (!decl->has_func_type) {
-    Index func_type_index = module->GetFuncTypeIndex(decl->sig);
+  if (!decl.has_func_type) {
+    Index func_type_index = module->GetFuncTypeIndex(decl.sig);
     if (func_type_index == kInvalidIndex) {
       auto func_type_field = MakeUnique<FuncTypeModuleField>(loc);
-      func_type_field->func_type.sig = decl->sig;
+      func_type_field->func_type.sig = decl.sig;
       module->AppendField(std::move(func_type_field));
     }
   }
+}
+
+bool IsInlinableFuncSignature(const FuncSignature& sig) {
+  return sig.GetNumParams() == 0 && sig.GetNumResults() <= 1;
 }
 
 class ResolveFuncTypesExprVisitorDelegate : public ExprVisitor::DelegateNop {
@@ -289,8 +267,9 @@ class ResolveFuncTypesExprVisitorDelegate : public ExprVisitor::DelegateNop {
       : module_(module) {}
 
   void ResolveBlockDeclaration(const Location& loc, BlockDeclaration* decl) {
-    if (decl->GetNumParams() != 0 || decl->GetNumResults() > 1) {
-      ResolveFuncType(loc, module_, decl);
+    ResolveFuncTypeWithEmptySignature(*module_, decl);
+    if (!IsInlinableFuncSignature(decl->sig)) {
+      ResolveImplicitlyDefinedFunctionType(loc, module_, *decl);
     }
   }
 
@@ -300,11 +279,6 @@ class ResolveFuncTypesExprVisitorDelegate : public ExprVisitor::DelegateNop {
   }
 
   Result BeginIfExpr(IfExpr* expr) override {
-    ResolveBlockDeclaration(expr->loc, &expr->true_.decl);
-    return Result::Ok;
-  }
-
-  Result BeginIfExceptExpr(IfExceptExpr* expr) override {
     ResolveBlockDeclaration(expr->loc, &expr->true_.decl);
     return Result::Ok;
   }
@@ -320,7 +294,14 @@ class ResolveFuncTypesExprVisitorDelegate : public ExprVisitor::DelegateNop {
   }
 
   Result OnCallIndirectExpr(CallIndirectExpr* expr) override {
-    ResolveFuncType(expr->loc, module_, &expr->decl);
+    ResolveFuncTypeWithEmptySignature(*module_, &expr->decl);
+    ResolveImplicitlyDefinedFunctionType(expr->loc, module_, expr->decl);
+    return Result::Ok;
+  }
+
+  Result OnReturnCallIndirectExpr(ReturnCallIndirectExpr* expr) override {
+    ResolveFuncTypeWithEmptySignature(*module_, &expr->decl);
+    ResolveImplicitlyDefinedFunctionType(expr->loc, module_, expr->decl);
     return Result::Ok;
   }
 
@@ -335,12 +316,17 @@ void ResolveFuncTypes(Module* module) {
     if (auto* func_field = dyn_cast<FuncModuleField>(&field)) {
       func = &func_field->func;
       decl = &func->decl;
+    } else if (auto* event_field = dyn_cast<EventModuleField>(&field)) {
+      decl = &event_field->event.decl;
     } else if (auto* import_field = dyn_cast<ImportModuleField>(&field)) {
       if (auto* func_import =
               dyn_cast<FuncImport>(import_field->import.get())) {
         // Only check the declaration, not the function itself, since it is an
         // import.
         decl = &func_import->func.decl;
+      } else if (auto* event_import =
+                     dyn_cast<EventImport>(import_field->import.get())) {
+        decl = &event_import->event.decl;
       } else {
         continue;
       }
@@ -349,7 +335,8 @@ void ResolveFuncTypes(Module* module) {
     }
 
     if (decl) {
-      ResolveFuncType(field.loc, module, decl);
+      ResolveFuncTypeWithEmptySignature(*module, decl);
+      ResolveImplicitlyDefinedFunctionType(field.loc, module, *decl);
     }
 
     if (func) {
@@ -376,16 +363,13 @@ void AppendInlineExportFields(Module* module,
 }  // End of anonymous namespace
 
 WastParser::WastParser(WastLexer* lexer,
-                       ErrorHandler* error_handler,
+                       Errors* errors,
                        WastParseOptions* options)
-    : lexer_(lexer), error_handler_(error_handler), options_(options) {}
+    : lexer_(lexer), errors_(errors), options_(options) {}
 
 void WastParser::Error(Location loc, const char* format, ...) {
-  errors_++;
-  va_list args;
-  va_start(args, format);
-  WastFormatError(error_handler_, &loc, lexer_, format, args);
-  va_end(args);
+  WABT_SNPRINTF_ALLOCA(buffer, length, format);
+  errors_->emplace_back(ErrorLevel::Error, loc, buffer);
 }
 
 Token WastParser::GetToken() {
@@ -748,7 +732,7 @@ Result WastParser::ParseModule(std::unique_ptr<Module>* out_module) {
   }
 
   EXPECT(Eof);
-  if (errors_ == 0) {
+  if (errors_->size() == 0) {
     *out_module = std::move(module);
     return Result::Ok;
   } else {
@@ -777,7 +761,7 @@ Result WastParser::ParseScript(std::unique_ptr<Script>* out_script) {
   }
 
   EXPECT(Eof);
-  if (errors_ == 0) {
+  if (errors_->size() == 0) {
     *out_script = std::move(script);
     return Result::Ok;
   } else {
@@ -801,7 +785,7 @@ Result WastParser::ParseModuleField(Module* module) {
   switch (Peek(1)) {
     case TokenType::Data:   return ParseDataModuleField(module);
     case TokenType::Elem:   return ParseElemModuleField(module);
-    case TokenType::Except: return ParseExceptModuleField(module);
+    case TokenType::Event:  return ParseEventModuleField(module);
     case TokenType::Export: return ParseExportModuleField(module);
     case TokenType::Func:   return ParseFuncModuleField(module);
     case TokenType::Type:   return ParseTypeModuleField(module);
@@ -821,10 +805,18 @@ Result WastParser::ParseDataModuleField(Module* module) {
   WABT_TRACE(ParseDataModuleField);
   EXPECT(Lpar);
   Location loc = GetLocation();
-  auto field = MakeUnique<DataSegmentModuleField>(loc);
   EXPECT(Data);
-  ParseVarOpt(&field->data_segment.memory_var, Var(0, loc));
-  CHECK_RESULT(ParseOffsetExpr(&field->data_segment.offset));
+  std::string name;
+  ParseBindVarOpt(&name);
+  auto field = MakeUnique<DataSegmentModuleField>(loc, name);
+
+  if (Peek() == TokenType::Passive) {
+    Consume();
+    field->data_segment.passive = true;
+  } else {
+    ParseVarOpt(&field->data_segment.memory_var, Var(0, loc));
+    CHECK_RESULT(ParseOffsetExpr(&field->data_segment.offset));
+  }
   ParseTextListOpt(&field->data_segment.data);
   EXPECT(Rpar);
   module->AppendField(std::move(field));
@@ -835,23 +827,32 @@ Result WastParser::ParseElemModuleField(Module* module) {
   WABT_TRACE(ParseElemModuleField);
   EXPECT(Lpar);
   Location loc = GetLocation();
-  auto field = MakeUnique<ElemSegmentModuleField>(loc);
   EXPECT(Elem);
-  ParseVarOpt(&field->elem_segment.table_var, Var(0, loc));
-  CHECK_RESULT(ParseOffsetExpr(&field->elem_segment.offset));
+  std::string name;
+  ParseBindVarOpt(&name);
+  auto field = MakeUnique<ElemSegmentModuleField>(loc, name);
+
+  if (Peek() == TokenType::Passive) {
+    Consume();
+    field->elem_segment.passive = true;
+  } else {
+    ParseVarOpt(&field->elem_segment.table_var, Var(0, loc));
+    CHECK_RESULT(ParseOffsetExpr(&field->elem_segment.offset));
+  }
   ParseVarListOpt(&field->elem_segment.vars);
   EXPECT(Rpar);
   module->AppendField(std::move(field));
   return Result::Ok;
 }
 
-Result WastParser::ParseExceptModuleField(Module* module) {
-  WABT_TRACE(ParseExceptModuleField);
+Result WastParser::ParseEventModuleField(Module* module) {
+  WABT_TRACE(ParseEventModuleField);
   EXPECT(Lpar);
-  auto field = MakeUnique<ExceptionModuleField>(GetLocation());
-  EXPECT(Except);
-  ParseBindVarOpt(&field->except.name);
-  CHECK_RESULT(ParseValueTypeList(&field->except.sig));
+  auto field = MakeUnique<EventModuleField>(GetLocation());
+  EXPECT(Event);
+  ParseBindVarOpt(&field->event.name);
+  CHECK_RESULT(ParseTypeUseOpt(&field->event.decl));
+  CHECK_RESULT(ParseUnboundFuncSignature(&field->event.decl.sig));
   EXPECT(Rpar);
   module->AppendField(std::move(field));
   return Result::Ok;
@@ -886,7 +887,7 @@ Result WastParser::ParseFuncModuleField(Module* module) {
     Func& func = import->func;
     CHECK_RESULT(ParseInlineImport(import.get()));
     CHECK_RESULT(ParseTypeUseOpt(&func.decl));
-    CHECK_RESULT(ParseFuncSignature(&func.decl.sig, &func.param_bindings));
+    CHECK_RESULT(ParseFuncSignature(&func.decl.sig, &func.bindings));
     CHECK_RESULT(ErrorIfLpar({"type", "param", "result"}));
     auto field =
         MakeUnique<ImportModuleField>(std::move(import), GetLocation());
@@ -895,10 +896,10 @@ Result WastParser::ParseFuncModuleField(Module* module) {
     auto field = MakeUnique<FuncModuleField>(loc, name);
     Func& func = field->func;
     CHECK_RESULT(ParseTypeUseOpt(&func.decl));
-    CHECK_RESULT(ParseFuncSignature(&func.decl.sig, &func.param_bindings));
+    CHECK_RESULT(ParseFuncSignature(&func.decl.sig, &func.bindings));
     TypeVector local_types;
     CHECK_RESULT(ParseBoundValueTypeList(TokenType::Local, &local_types,
-                                         &func.local_bindings));
+                                         &func.bindings, func.GetNumParams()));
     func.local_types.Set(local_types);
     CHECK_RESULT(ParseTerminatingInstrList(&func.exprs));
     module->AppendField(std::move(field));
@@ -984,8 +985,8 @@ Result WastParser::ParseImportModuleField(Module* module) {
         CHECK_RESULT(ParseTypeUseOpt(&import->func.decl));
         EXPECT(Rpar);
       } else {
-        CHECK_RESULT(ParseFuncSignature(&import->func.decl.sig,
-                                        &import->func.param_bindings));
+        CHECK_RESULT(
+            ParseFuncSignature(&import->func.decl.sig, &import->func.bindings));
         CHECK_RESULT(ErrorIfLpar({"param", "result"}));
         EXPECT(Rpar);
       }
@@ -998,7 +999,7 @@ Result WastParser::ParseImportModuleField(Module* module) {
       ParseBindVarOpt(&name);
       auto import = MakeUnique<TableImport>(name);
       CHECK_RESULT(ParseLimits(&import->table.elem_limits));
-      EXPECT(Anyfunc);
+      EXPECT(Funcref);
       EXPECT(Rpar);
       field = MakeUnique<ImportModuleField>(std::move(import), loc);
       break;
@@ -1024,11 +1025,12 @@ Result WastParser::ParseImportModuleField(Module* module) {
       break;
     }
 
-    case TokenType::Except: {
+    case TokenType::Event: {
       Consume();
       ParseBindVarOpt(&name);
-      auto import = MakeUnique<ExceptionImport>(name);
-      CHECK_RESULT(ParseValueTypeList(&import->except.sig));
+      auto import = MakeUnique<EventImport>(name);
+      CHECK_RESULT(ParseTypeUseOpt(&import->event.decl));
+      CHECK_RESULT(ParseUnboundFuncSignature(&import->event.decl.sig));
       EXPECT(Rpar);
       field = MakeUnique<ImportModuleField>(std::move(import), loc);
       break;
@@ -1123,11 +1125,11 @@ Result WastParser::ParseTableModuleField(Module* module) {
     auto import = MakeUnique<TableImport>(name);
     CHECK_RESULT(ParseInlineImport(import.get()));
     CHECK_RESULT(ParseLimits(&import->table.elem_limits));
-    EXPECT(Anyfunc);
+    EXPECT(Funcref);
     auto field =
         MakeUnique<ImportModuleField>(std::move(import), GetLocation());
     module->AppendField(std::move(field));
-  } else if (Match(TokenType::Anyfunc)) {
+  } else if (Match(TokenType::Funcref)) {
     EXPECT(Lpar);
     EXPECT(Elem);
 
@@ -1148,7 +1150,7 @@ Result WastParser::ParseTableModuleField(Module* module) {
   } else {
     auto field = MakeUnique<TableModuleField>(loc, name);
     CHECK_RESULT(ParseLimits(&field->table.elem_limits));
-    EXPECT(Anyfunc);
+    EXPECT(Funcref);
     module->AppendField(std::move(field));
   }
 
@@ -1166,7 +1168,7 @@ Result WastParser::ParseExportDesc(Export* export_) {
     case TokenType::Table:  export_->kind = ExternalKind::Table; break;
     case TokenType::Memory: export_->kind = ExternalKind::Memory; break;
     case TokenType::Global: export_->kind = ExternalKind::Global; break;
-    case TokenType::Except: export_->kind = ExternalKind::Except; break;
+    case TokenType::Event:  export_->kind = ExternalKind::Event; break;
     default:
       return ErrorExpected({"an external kind"});
   }
@@ -1231,7 +1233,8 @@ Result WastParser::ParseUnboundFuncSignature(FuncSignature* sig) {
 
 Result WastParser::ParseBoundValueTypeList(TokenType token,
                                            TypeVector* types,
-                                           BindingHash* bindings) {
+                                           BindingHash* bindings,
+                                           Index binding_index_offset) {
   WABT_TRACE(ParseBoundValueTypeList);
   while (MatchLpar(token)) {
     if (PeekMatch(TokenType::Var)) {
@@ -1240,7 +1243,8 @@ Result WastParser::ParseBoundValueTypeList(TokenType token,
       Location loc = GetLocation();
       ParseBindVarOpt(&name);
       CHECK_RESULT(ParseValueType(&type));
-      bindings->emplace(name, Binding(loc, types->size()));
+      bindings->emplace(name,
+                        Binding(loc, binding_index_offset + types->size()));
       types->push_back(type);
     } else {
       CHECK_RESULT(ParseValueTypeList(types));
@@ -1393,29 +1397,43 @@ Result WastParser::ParsePlainInstr(std::unique_ptr<Expr>* out_expr) {
       break;
     }
 
-    case TokenType::GetLocal:
-      Consume();
-      CHECK_RESULT(ParsePlainInstrVar<GetLocalExpr>(loc, out_expr));
+    case TokenType::ReturnCall:
+      ErrorUnlessOpcodeEnabled(Consume());
+      CHECK_RESULT(ParsePlainInstrVar<ReturnCallExpr>(loc, out_expr));
       break;
 
-    case TokenType::SetLocal:
+    case TokenType::ReturnCallIndirect: {
+      ErrorUnlessOpcodeEnabled(Consume());
+      auto expr = MakeUnique<ReturnCallIndirectExpr>(loc);
+      CHECK_RESULT(ParseTypeUseOpt(&expr->decl));
+      CHECK_RESULT(ParseUnboundFuncSignature(&expr->decl.sig));
+      *out_expr = std::move(expr);
+      break;
+    }
+
+    case TokenType::LocalGet:
       Consume();
-      CHECK_RESULT(ParsePlainInstrVar<SetLocalExpr>(loc, out_expr));
+      CHECK_RESULT(ParsePlainInstrVar<LocalGetExpr>(loc, out_expr));
       break;
 
-    case TokenType::TeeLocal:
+    case TokenType::LocalSet:
       Consume();
-      CHECK_RESULT(ParsePlainInstrVar<TeeLocalExpr>(loc, out_expr));
+      CHECK_RESULT(ParsePlainInstrVar<LocalSetExpr>(loc, out_expr));
       break;
 
-    case TokenType::GetGlobal:
+    case TokenType::LocalTee:
       Consume();
-      CHECK_RESULT(ParsePlainInstrVar<GetGlobalExpr>(loc, out_expr));
+      CHECK_RESULT(ParsePlainInstrVar<LocalTeeExpr>(loc, out_expr));
       break;
 
-    case TokenType::SetGlobal:
+    case TokenType::GlobalGet:
       Consume();
-      CHECK_RESULT(ParsePlainInstrVar<SetGlobalExpr>(loc, out_expr));
+      CHECK_RESULT(ParsePlainInstrVar<GlobalGetExpr>(loc, out_expr));
+      break;
+
+    case TokenType::GlobalSet:
+      Consume();
+      CHECK_RESULT(ParsePlainInstrVar<GlobalSetExpr>(loc, out_expr));
       break;
 
     case TokenType::Load:
@@ -1457,6 +1475,26 @@ Result WastParser::ParsePlainInstr(std::unique_ptr<Expr>* out_expr) {
       break;
     }
 
+    case TokenType::MemoryCopy:
+      ErrorUnlessOpcodeEnabled(Consume());
+      out_expr->reset(new MemoryCopyExpr(loc));
+      break;
+
+    case TokenType::MemoryFill:
+      ErrorUnlessOpcodeEnabled(Consume());
+      out_expr->reset(new MemoryFillExpr(loc));
+      break;
+
+    case TokenType::DataDrop:
+      ErrorUnlessOpcodeEnabled(Consume());
+      CHECK_RESULT(ParsePlainInstrVar<DataDropExpr>(loc, out_expr));
+      break;
+
+    case TokenType::MemoryInit:
+      ErrorUnlessOpcodeEnabled(Consume());
+      CHECK_RESULT(ParsePlainInstrVar<MemoryInitExpr>(loc, out_expr));
+      break;
+
     case TokenType::MemorySize:
       Consume();
       out_expr->reset(new MemorySizeExpr(loc));
@@ -1465,6 +1503,21 @@ Result WastParser::ParsePlainInstr(std::unique_ptr<Expr>* out_expr) {
     case TokenType::MemoryGrow:
       Consume();
       out_expr->reset(new MemoryGrowExpr(loc));
+      break;
+
+    case TokenType::TableCopy:
+      ErrorUnlessOpcodeEnabled(Consume());
+      out_expr->reset(new TableCopyExpr(loc));
+      break;
+
+    case TokenType::ElemDrop:
+      ErrorUnlessOpcodeEnabled(Consume());
+      CHECK_RESULT(ParsePlainInstrVar<ElemDropExpr>(loc, out_expr));
+      break;
+
+    case TokenType::TableInit:
+      ErrorUnlessOpcodeEnabled(Consume());
+      CHECK_RESULT(ParsePlainInstrVar<TableInitExpr>(loc, out_expr));
       break;
 
     case TokenType::Throw:
@@ -1477,11 +1530,11 @@ Result WastParser::ParsePlainInstr(std::unique_ptr<Expr>* out_expr) {
       out_expr->reset(new RethrowExpr(loc));
       break;
 
-    case TokenType::AtomicWake: {
+    case TokenType::AtomicNotify: {
       Token token = Consume();
       ErrorUnlessOpcodeEnabled(token);
       CHECK_RESULT(
-          ParsePlainLoadStoreInstr<AtomicWakeExpr>(loc, token, out_expr));
+          ParsePlainLoadStoreInstr<AtomicNotifyExpr>(loc, token, out_expr));
       break;
     }
 
@@ -1749,23 +1802,6 @@ Result WastParser::ParseBlockInstr(std::unique_ptr<Expr>* out_expr) {
       break;
     }
 
-    case TokenType::IfExcept: {
-      ErrorUnlessOpcodeEnabled(Consume());
-      auto expr = MakeUnique<IfExceptExpr>(loc);
-      CHECK_RESULT(ParseIfExceptHeader(expr.get()));
-      CHECK_RESULT(ParseInstrList(&expr->true_.exprs));
-      expr->true_.end_loc = GetLocation();
-      if (Match(TokenType::Else)) {
-        CHECK_RESULT(ParseEndLabelOpt(expr->true_.label));
-        CHECK_RESULT(ParseTerminatingInstrList(&expr->false_));
-        expr->false_end_loc = GetLocation();
-      }
-      EXPECT(End);
-      CHECK_RESULT(ParseEndLabelOpt(expr->true_.label));
-      *out_expr = std::move(expr);
-      break;
-    }
-
     case TokenType::Try: {
       ErrorUnlessOpcodeEnabled(Consume());
       auto expr = MakeUnique<TryExpr>(loc);
@@ -1831,62 +1867,6 @@ Result WastParser::ParseBlock(Block* block) {
   CHECK_RESULT(ParseBlockDeclaration(&block->decl));
   CHECK_RESULT(ParseInstrList(&block->exprs));
   block->end_loc = GetLocation();
-  return Result::Ok;
-}
-
-Result WastParser::ParseIfExceptHeader(IfExceptExpr* expr) {
-  WABT_TRACE(ParseIfExceptHeader);
-  // if_except has the syntax:
-  //
-  //     if_except label_opt block_type except_index
-  //
-  // This means that it can have a few different forms:
-  //
-  //     1. if_except <num> ...
-  //     2. if_except $except ...
-  //     3. if_except $label $except/<num> ...
-  //     4. if_except (result...) $except/<num> ...
-  //     5. if_except $label (result...) $except/<num> ...
-  //
-  // With the multi-value proposal, `block_type` can be (param...) (result...),
-  // so there are more forms:
-  //
-  //     6. if_except (param...) $except/<num> ...
-  //     7. if_except (param...) (result...) $except/<num> ...
-  //     8. if_except $label (param...) $except/<num> ...
-  //     9. if_except $label (param...) (result...) $except/<num> ...
-  //
-  // This case is handled by ParseBlockDeclaration, but it means we also need
-  // to check for the `param` token here.
-
-  if (PeekMatchLpar(TokenType::Result) || PeekMatchLpar(TokenType::Param)) {
-    // Cases 4, 6, 7.
-    CHECK_RESULT(ParseBlockDeclaration(&expr->true_.decl));
-    CHECK_RESULT(ParseVar(&expr->except_var));
-  } else if (PeekMatch(TokenType::Nat)) {
-    // Case 1.
-    CHECK_RESULT(ParseVar(&expr->except_var));
-  } else if (PeekMatch(TokenType::Var)) {
-    // Cases 2, 3, 5, 8, 9.
-    Var var;
-    CHECK_RESULT(ParseVar(&var));
-    if (PeekMatchLpar(TokenType::Result) || PeekMatchLpar(TokenType::Param)) {
-      // Cases 5, 8, 9.
-      expr->true_.label = var.name();
-      CHECK_RESULT(ParseBlockDeclaration(&expr->true_.decl));
-      CHECK_RESULT(ParseVar(&expr->except_var));
-    } else if (ParseVarOpt(&expr->except_var, Var())) {
-      // Case 3.
-      expr->true_.label = var.name();
-    } else {
-      // Case 2.
-      expr->except_var = var;
-    }
-  } else {
-    return ErrorExpected({"a var", "a block type"},
-                         "12 or $foo or (result ...)");
-  }
-
   return Result::Ok;
 }
 
@@ -1956,6 +1936,7 @@ Result WastParser::ParseExpr(ExprList* exprs) {
 
         if (MatchLpar(TokenType::Then)) {
           CHECK_RESULT(ParseTerminatingInstrList(&expr->true_.exprs));
+          expr->true_.end_loc = GetLocation();
           EXPECT(Rpar);
 
           if (MatchLpar(TokenType::Else)) {
@@ -1964,47 +1945,13 @@ Result WastParser::ParseExpr(ExprList* exprs) {
           } else if (PeekMatchExpr()) {
             CHECK_RESULT(ParseExpr(&expr->false_));
           }
+          expr->false_end_loc = GetLocation();
         } else if (PeekMatchExpr()) {
           CHECK_RESULT(ParseExpr(&expr->true_.exprs));
+          expr->true_.end_loc = GetLocation();
           if (PeekMatchExpr()) {
             CHECK_RESULT(ParseExpr(&expr->false_));
-          }
-        } else {
-          ConsumeIfLpar();
-          return ErrorExpected({"then block"}, "(then ...)");
-        }
-
-        exprs->push_back(std::move(expr));
-        break;
-      }
-
-      case TokenType::IfExcept: {
-        Consume();
-        ErrorUnlessOpcodeEnabled(Consume());
-        auto expr = MakeUnique<IfExceptExpr>(loc);
-
-        CHECK_RESULT(ParseIfExceptHeader(expr.get()));
-
-        if (PeekMatchExpr()) {
-          ExprList cond;
-          CHECK_RESULT(ParseExpr(&cond));
-          exprs->splice(exprs->end(), cond);
-        }
-
-        if (MatchLpar(TokenType::Then)) {
-          CHECK_RESULT(ParseTerminatingInstrList(&expr->true_.exprs));
-          EXPECT(Rpar);
-
-          if (MatchLpar(TokenType::Else)) {
-            CHECK_RESULT(ParseTerminatingInstrList(&expr->false_));
-            EXPECT(Rpar);
-          } else if (PeekMatchExpr()) {
-            CHECK_RESULT(ParseExpr(&expr->false_));
-          }
-        } else if (PeekMatchExpr()) {
-          CHECK_RESULT(ParseExpr(&expr->true_.exprs));
-          if (PeekMatchExpr()) {
-            CHECK_RESULT(ParseExpr(&expr->false_));
+            expr->false_end_loc = GetLocation();
           }
         } else {
           ConsumeIfLpar();
@@ -2206,12 +2153,21 @@ Result WastParser::ParseModuleCommand(Script* script, CommandPtr* out_command) {
     case ScriptModuleType::Binary: {
       auto* bsm = cast<BinaryScriptModule>(script_module.get());
       ReadBinaryOptions options;
-      BinaryErrorHandlerModule error_handler(&bsm->loc, this);
+      Errors errors;
       const char* filename = "<text>";
       ReadBinaryIr(filename, bsm->data.data(), bsm->data.size(), options,
-                   &error_handler, &module);
+                   &errors, &module);
       module.name = bsm->name;
       module.loc = bsm->loc;
+      for (const auto& error: errors) {
+        assert(error.error_level == ErrorLevel::Error);
+        if (error.loc.offset == kInvalidOffset) {
+          Error(bsm->loc, "error in binary module: %s", error.message.c_str());
+        } else {
+          Error(bsm->loc, "error in binary module: @0x%08" PRIzx ": %s",
+                error.loc.offset, error.message.c_str());
+        }
+      }
       break;
     }
 
@@ -2382,7 +2338,7 @@ void WastParser::CheckImportOrdering(Module* module) {
       module->tables.size() != module->num_table_imports ||
       module->memories.size() != module->num_memory_imports ||
       module->globals.size() != module->num_global_imports ||
-      module->excepts.size() != module->num_except_imports) {
+      module->events.size() != module->num_event_imports) {
     Error(GetLocation(),
           "imports must occur before all non-import definitions");
   }
@@ -2390,19 +2346,19 @@ void WastParser::CheckImportOrdering(Module* module) {
 
 Result ParseWatModule(WastLexer* lexer,
                       std::unique_ptr<Module>* out_module,
-                      ErrorHandler* error_handler,
+                      Errors* errors,
                       WastParseOptions* options) {
   assert(out_module != nullptr);
-  WastParser parser(lexer, error_handler, options);
+  WastParser parser(lexer, errors, options);
   return parser.ParseModule(out_module);
 }
 
 Result ParseWastScript(WastLexer* lexer,
                        std::unique_ptr<Script>* out_script,
-                       ErrorHandler* error_handler,
+                       Errors* errors,
                        WastParseOptions* options) {
   assert(out_script != nullptr);
-  WastParser parser(lexer, error_handler, options);
+  WastParser parser(lexer, errors, options);
   return parser.ParseScript(out_script);
 }
 
